@@ -1,6 +1,11 @@
 # euc_ble
 
-Three PlatformIO projects for electric-unicycle (EUC) telemetry and low-latency WiFi video. Built on an Arduino Nano 33 IoT (BLE telemetry + OTA), an ESP32-CAM-S3 (camera sender), and an ESP32-C3/C6 with a 1.47" ST7789 LCD (video receiver).
+Four PlatformIO projects for electric-unicycle (EUC) telemetry and low-latency WiFi video:
+
+- **Arduino Nano 33 IoT** — BLE telemetry collector + web UI (reference implementation)
+- **ESP32-S3 CAM** — WiFi UDP video sender
+- **ESP32-S3 LCD** — WiFi UDP video receiver
+- **ESP32-C6 LCD** — LVGL telemetry HUD (BLE to Nosfet Apex)
 
 ---
 
@@ -10,15 +15,16 @@ Three PlatformIO projects for electric-unicycle (EUC) telemetry and low-latency 
 2. [Repository layout](#repository-layout)
 3. [Project 1: Arduino Nano 33 IoT — BLE telemetry](#project-1-arduino-nano-33-iot--ble-telemetry)
 4. [Project 2: ESP32-CAM-S3 — video streamer](#project-2-esp32-cam-s3--video-streamer)
-5. [Project 3: ESP32-C3/C6 LCD — video receiver](#project-3-esp32-c3c6-lcd--video-receiver)
-6. [Shared video protocol](#shared-video-protocol)
-7. [Hardware we used](#hardware-we-used)
-8. [Tooling and prerequisites](#tooling-and-prerequisites)
-9. [What we learned about the Nosfet Apex](#what-we-learned-about-the-nosfet-apex)
-10. [NINA firmware update (WiFi + BLE concurrent)](#nina-firmware-update-wifi--ble-concurrent)
-11. [Build, flash, and OTA](#build-flash-and-ota)
-12. [Troubleshooting](#troubleshooting)
-13. [Current status and next steps](#current-status-and-next-steps)
+5. [Project 3: ESP32-S3 LCD — video receiver](#project-3-esp32-s3-lcd--video-receiver)
+6. [Project 4: ESP32-C6 LCD — EUC telemetry HUD](#project-4-esp32-c6-lcd--euc-telemetry-hud)
+7. [Shared video protocol](#shared-video-protocol)
+8. [Hardware we used](#hardware-we-used)
+9. [Tooling and prerequisites](#tooling-and-prerequisites)
+10. [What we learned about the Nosfet Apex](#what-we-learned-about-the-nosfet-apex)
+11. [NINA firmware update (WiFi + BLE concurrent)](#nina-firmware-update-wifi--ble-concurrent)
+12. [Build, flash, and monitor](#build-flash-and-monitor)
+13. [Troubleshooting](#troubleshooting)
+14. [Current status and next steps](#current-status-and-next-steps)
 
 ---
 
@@ -37,30 +43,39 @@ euc_ble/
 ├── README.md                          ← this file
 ├── .gitignore
 │
-├── arduino-nano33iot-nf7266/          ← BLE central + Veteran parser + WiFi OTA
+├── arduino-nano33iot-nf7266/          ← BLE central + Veteran parser + web UI
 │   ├── platformio.ini
 │   ├── include/
-│   │   ├── config.h                   BLE UUIDs, hotspot, wheel MAC, timings
+│   │   ├── config.h                   BLE UUIDs, hotspot, wheel MAC, display name, timings
 │   │   ├── web_server.h               HTTP server + web UI (HTML/JS)
 │   │   ├── ble_scan_store.h           BLE scan cache for API
-│   │   ├── veteran_protocol.h         Frame reassembly + telemetry parser
-│   │   ├── ninebot_protocol.h         Legacy Ninebot parser (unused)
-│   │   ├── wifi_secrets.h.example     Template for home WiFi credentials
-│   │   └── wifi_secrets.h             Local secrets (gitignored)
-│   ├── src/
-│   │   ├── main.cpp                   Production firmware (BLE + OTA)
-│   │   └── ota/ota_main.cpp           WiFi-only OTA bootstrap sketch
-│   └── .tools/                        arduino-fwuploader, arduinoOTA binaries
+│   │   ├── veteran_protocol.h         Frame reassembly + telemetry parser + HUD serial line
+│   │   └── ninebot_protocol.h         Legacy Ninebot parser (unused)
+│   └── src/
+│       └── main.cpp                   Production firmware (BLE + hotspot + web UI)
 │
 ├── esp32-cam-s3-streamer/             ← Camera → UDP JPEG sender
 │   ├── platformio.ini
 │   ├── include/config.h, camera_pins.h, video_protocol.h
 │   └── src/main.cpp
 │
-└── esp32-c3-lcd-display/              ← UDP JPEG receiver → ST7789 LCD
-    ├── platformio.ini
-    ├── include/config.h, display_setup.h, frame_receiver.h, video_protocol.h
-    └── src/main.cpp, frame_receiver.cpp
+├── esp32-s3-lcd-display/              ← UDP JPEG receiver → ST7789 LCD (S3 + PSRAM)
+│   ├── platformio.ini
+│   ├── include/config.h, display_setup.h, frame_receiver.h, video_protocol.h
+│   └── src/main.cpp, frame_receiver.cpp
+│
+└── esp32-c6-hud/                      ← BLE Veteran HUD + repeater → LVGL on ST7789 LCD
+    ├── README.md
+    ├── platformio.ini                 esp32-c6-hud + hud-sim environments
+    ├── scripts/run-hud-sim.sh         Desktop preview (SDL2 + Nano serial or mock)
+    ├── include/
+    │   ├── config.h                   Wheel MAC, display name, BLE UUIDs, LVGL config
+    │   ├── veteran_protocol.h, euc_ble.h, hud_ui.h, hud_view.h
+    │   └── lv_font_speed_115.h
+    ├── src/
+    │   ├── main.cpp, euc_ble.cpp, display_lvgl.cpp, hud_ui.cpp
+    │   └── fonts/lv_font_speed_115.c
+    └── sim/                           Desktop simulator (shared hud_ui.cpp)
 ```
 
 ---
@@ -75,7 +90,7 @@ On boot the board:
 2. Initializes **ArduinoBLE** as a central and **direct-connects** to the configured wheel MAC (`88:25:83:f6:21:0f` by default), or connects via BLE scan.
 3. Subscribes to **FFE1** notifications and reassembles **Veteran** frames (`DC 5A 5C` …).
 4. Serves a **web UI** on port **80**: speedometer (mph), live telemetry (imperial), BLE scanner, Connect/Scan buttons.
-5. **Switch to WiFi for OTA** button disconnects the hotspot, joins your home WiFi, and enables **ArduinoOTA** on port **65280** (NINA cannot run AP + STA simultaneously).
+5. Optionally streams **HUD serial lines** for the desktop simulator when `SERIAL_HUD_STREAM` is enabled.
 6. Auto-reconnects to the wheel on BLE disconnect.
 
 ### Architecture
@@ -85,16 +100,11 @@ On boot the board:
   Phone / laptop    │  Nano 33 IoT (SAMD21 + NINA-W102)   │
   joins EUC-NANO ──▶│  Hotspot 192.168.4.1  :80  web UI   │
                     │  BLE central ──▶ Nosfet Apex (FFE1) │
-                    └──────────────┬──────────────────────┘
-                                   │ "Switch to WiFi for OTA"
-                                   ▼
-                    ┌─────────────────────────────────────┐
-                    │  Home router (e.g. WiHelloThere)    │
-                    │  ArduinoOTA :65280 ◀── PC upload  │
+                    │  USB serial HUD feed (optional)     │
                     └─────────────────────────────────────┘
 ```
 
-After NINA **3.0.1**, WiFi (either AP or STA) and BLE run **concurrently**. The board is in **one WiFi mode at a time** — hotspot for field use, home WiFi for OTA.
+After NINA **3.0.1**, WiFi and BLE run **concurrently** on the hotspot.
 
 ### Web UI
 
@@ -106,9 +116,14 @@ After NINA **3.0.1**, WiFi (either AP or STA) and BLE run **concurrently**. The 
 | Timing bar | Wheel Hz, web poll interval, data age, frames/poll |
 | Scan | 12 s BLE discovery table |
 | Connect | Direct connect to `WHEEL_MAC_ADDRESS` |
-| WiFi toggle | **Switch to WiFi for OTA** / **Back to hotspot** |
 
 Poll interval: `WEB_REFRESH_MS` (default **250 ms**) in `config.h`.
+
+When `SERIAL_HUD_STREAM` is `1`, each telemetry frame also prints a CSV line on USB serial for the [ESP32-C6 HUD simulator](esp32-c6-hud/README.md):
+
+```
+HUD,<speed_kmh>,<voltage_v>,<current_a>,<battery_pct>,<temp_c>,<charging>
+```
 
 ### HTTP API
 
@@ -118,8 +133,6 @@ Poll interval: `WEB_REFRESH_MS` (default **250 ms**) in `config.h`.
 | GET | `/api/devices` | JSON: `devices[]`, `telemetry`, `wifi`, `connected` |
 | POST | `/api/scan` | Start BLE scan |
 | POST | `/api/connect` | Direct connect to configured MAC |
-| POST | `/api/wifi/ota` | Switch to home WiFi for OTA |
-| POST | `/api/wifi/ap` | Switch back to hotspot |
 
 ### Veteran BLE protocol (summary)
 
@@ -145,20 +158,17 @@ Implementation: `include/veteran_protocol.h` (`FrameReassembler` + `parseRealtim
 
 | Environment | Purpose | Source |
 |-------------|---------|--------|
-| `nano33iot` | **Production** — BLE + Veteran + OTA | `src/main.cpp` |
-| `nano33iot-ota` | **Bootstrap** — WiFi + OTA only (recovery) | `src/ota/ota_main.cpp` |
+| `nano33iot` | **Production** — BLE + Veteran + hotspot + web UI | `src/main.cpp` |
 
 ### Configuration files
 
-**`include/config.h`** — Hotspot SSID/password, wheel MAC, web poll rate, BLE matching.
+**`include/config.h`** — Hotspot SSID/password, wheel MAC, display name, web poll rate, BLE matching, HUD serial stream.
 
-**`include/wifi_secrets.h`** — Home WiFi credentials for OTA (copy from `wifi_secrets.h.example`):
-
-```cpp
-#define SECRET_SSID "your-home-ssid"
-#define SECRET_PASS "your-home-password"
-#define OTA_UPLOAD_PASSWORD "password"
-```
+| Setting | Purpose |
+|---------|---------|
+| `WHEEL_MAC_ADDRESS` | Direct-connect BLE MAC |
+| `WHEEL_DISPLAY_NAME` | Friendly name for web UI / HUD (empty = use BLE name) |
+| `SERIAL_HUD_STREAM` | `1` = print `HUD,...` CSV lines on USB serial for desktop simulator |
 
 **`include/veteran_protocol.h`** — Parser; no user config needed.
 
@@ -200,24 +210,92 @@ Pins: Freenove ESP32-S3 WROOM camera profile in `include/camera_pins.h`.
 
 ---
 
-## Project 3: ESP32-C3/C6 LCD — video receiver
+## Project 3: ESP32-S3 LCD — video receiver
 
 ### What it does
 
+- Runs on **Waveshare ESP32-S3-LCD-1.47** (16 MB flash, 8 MB OPI PSRAM, dual-core @ 240 MHz).
 - Connects as WiFi **station** to the camera AP (`EUC-VIDEO`).
-- Listens for UDP port **5555**, reassembles JPEG fragments.
-- Decodes and displays on a **Waveshare 1.47" ST7789** panel in landscape (**320×172** visible area).
+- Listens for UDP port **5555**, reassembles JPEG fragments into **PSRAM frame buffers**.
+- Decodes and displays on the onboard **1.47" ST7789** panel in landscape (**320×172** visible area).
+- Uses a **dual-core pipeline**: core 0 receives UDP, core 1 decodes and draws — leaves headroom for future LVGL overlays.
 
 ### PlatformIO environments
 
 | Environment | Board |
 |-------------|-------|
-| `esp32-c3-lcd` | Waveshare ESP32-C3 LCD 1.47" (default) |
-| `esp32-c6-lcd` | Waveshare ESP32-C6 LCD 1.47" |
+| `esp32-s3-lcd` | Waveshare ESP32-S3-LCD-1.47 (**default / supported**) |
 
-Uses GFX Library + JPEGDEC.
+Uses GFX Library + JPEGDEC. PSRAM buffers and dual-core tasks are enabled on the S3 target.
 
-**Status:** Created and builds; not yet field-tested in this session.
+**Status:** Built for S3; not yet field-tested.
+
+---
+
+## Project 4: ESP32-C6 LCD — EUC telemetry HUD + BLE repeater
+
+See also: [esp32-c6-hud/README.md](esp32-c6-hud/README.md)
+
+### What it does
+
+- Runs on **Waveshare ESP32-C6-LCD-1.47** (4 MB flash, 512 KB SRAM, BLE 5).
+- **BLE central** to the Nosfet Apex using the same Veteran protocol as the Nano project:
+  - GATT service **FFE0**, notify characteristic **FFE1**
+  - Frame magic `DC 5A 5C`, direct connect to configured wheel MAC
+- **BLE peripheral repeater** so phone apps (e.g. DarknessBot) can connect to the C6 instead of the wheel:
+  - Advertises as **`NF7266`** (or the wheel's actual name once discovered)
+  - Exposes the same **FFE0 / FFE1** GATT service
+  - **Notify passthrough** — wheel FFE1 bytes forwarded unchanged to the app
+  - **Write passthrough** — app FFE1 writes forwarded unchanged to the wheel
+- Renders an **LVGL HUD** on the onboard 1.47" ST7789 panel (landscape 320×172):
+  - Large speed readout (mph) using a native **115px digit font**
+  - Vertical **battery** and **temperature** bars with clipped value labels
+  - Voltage / current row at the bottom
+  - Background color by speed: dark (normal), orange (>52 mph), red (>55 mph)
+  - Speed text turns **black** on the orange warning background
+  - Status line shows **`WHEEL_DISPLAY_NAME`** when connected (instead of the BLE name), plus **`+DarknessBot`** when a proxy app is attached
+
+### Desktop simulator
+
+The simulator uses the **same** `src/hud_ui.cpp` as the ESP firmware. Preview UI changes on macOS before flashing hardware.
+
+```bash
+cd esp32-c6-hud
+./scripts/run-hud-sim.sh              # live Nano serial (auto-detects /dev/cu.usbmodem*)
+./scripts/run-hud-sim.sh --mock         # animated demo, no hardware needed
+```
+
+Requires **SDL2** (`brew install sdl2`). Live mode reads `HUD,...` CSV lines from the Nano (`SERIAL_HUD_STREAM` in Nano `config.h`).
+
+### Architecture (split roles)
+
+```
+ESP32-S3 CAM  ──WiFi UDP video──▶  ESP32-S3 LCD  (live camera feed)
+
+Nosfet Apex  ◀──BLE central────  ESP32-C6 HUD  ──BLE peripheral──▶  DarknessBot / phone
+                 (FFE1 notify)                      (FFE0/FFE1 proxy)
+
+Nano 33 IoT  ──USB serial HUD lines──▶  Desktop hud-sim  (UI development)
+```
+
+The C6 holds the only wheel BLE connection. Apps see the HUD advertising as the wheel and get the same GATT data stream.
+
+### PlatformIO
+
+```ini
+[env:esp32-c6-hud]
+platform = espressif32@55.3.39   ; pioarduino fork — required for C6 + Arduino 3.x
+board = esp32-c6-devkitc-1
+
+[env:hud-sim]
+platform = native                ; macOS desktop preview (SDL2)
+```
+
+Uses **NimBLE-Arduino**, **LVGL 8.3**, and **GFX Library for Arduino**.
+
+Wheel MAC, display name (`WHEEL_DISPLAY_NAME`), advertised name (`REPEATER_DEVICE_NAME`), and BLE UUIDs are in `include/config.h`.
+
+**Status:** Simulator tested on macOS; ESP firmware built, not yet field-tested on hardware.
 
 ---
 
@@ -243,7 +321,8 @@ The receiver crops QVGA 320×240 → 320×172 to match the physical panel.
 | **Arduino Nano 33 IoT** | BLE telemetry collector |
 | **Nosfet Apex** | Target EUC (151.2 V, Veteran protocol) |
 | **ESP32-S3 CAM** (Freenove) | Planned video sender |
-| **ESP32-C3 + 1.47" LCD** (Waveshare) | Planned video receiver |
+| **ESP32-S3-LCD-1.47** (Waveshare) | Video receiver (8 MB PSRAM) |
+| **ESP32-C6-LCD-1.47** (Waveshare) | BLE telemetry HUD (LVGL) |
 
 ---
 
@@ -262,9 +341,8 @@ export PATH="$HOME/Library/Python/3.14/bin:$PATH"
 | Tool | Version | Purpose |
 |------|---------|---------|
 | `arduino-fwuploader` | 2.4.1 | Flash **NINA-W102** module firmware |
-| `arduinoOTA` | 1.4.1 | Upload SAMD sketch over WiFi |
 
-Downloaded from [arduino-fwuploader releases](https://github.com/arduino/arduino-fwuploader/releases) and [arduinoOTA releases](https://github.com/arduino/arduinoOTA/releases).
+Downloaded from [arduino-fwuploader releases](https://github.com/arduino/arduino-fwuploader/releases).
 
 ### Libraries (nano33iot env)
 
@@ -272,7 +350,6 @@ Downloaded from [arduino-fwuploader releases](https://github.com/arduino/arduino
 |---------|---------|-------|
 | ArduinoBLE | ^2.0.0 | Required for concurrent WiFi+BLE |
 | WiFiNINA | ^2.0.0 | Required for concurrent WiFi+BLE |
-| ArduinoOTA | ^1.1.1 | jandrassy fork for SAMD InternalStorage |
 
 ---
 
@@ -347,14 +424,14 @@ tar -xzf arduino-fwuploader.tar.gz
 ### After NINA 3.0.1
 
 - `platformio.ini` uses `ArduinoBLE @ ^2.0.0` and `WiFiNINA @ ^2.0.0`.
-- `main.cpp` detects `firmware >= 3.0.1` and keeps WiFi + OTA running while BLE scans.
-- Serial shows both `ArduinoOTA ready @ …` and `Scanning for NF7266 / FFE0…` at the same time.
+- `main.cpp` detects `firmware >= 3.0.1` and keeps WiFi hotspot + web UI running while BLE connects.
+- Serial shows both hotspot ready and direct connect / scan activity at the same time.
 
 ---
 
-## Build, flash, and OTA
+## Build, flash, and monitor
 
-### Nano 33 IoT — USB flash (first time or recovery)
+### Nano 33 IoT — USB flash
 
 ```bash
 cd arduino-nano33iot-nf7266
@@ -365,49 +442,24 @@ pio run -e nano33iot -t upload --upload-port /dev/cu.usbmodem21101
 
 Board must be in runtime mode (USB PID **8057**). Bootloader is PID **0057** if upload fails — double-tap reset.
 
-### Nano 33 IoT — OTA flash (after switching to home WiFi)
-
-1. Join hotspot `EUC-NANO`, open http://192.168.4.1/
-2. Tap **Switch to WiFi for OTA**
-3. On your Mac (on home WiFi):
+### ESP32-C6 HUD — USB flash
 
 ```bash
-cd arduino-nano33iot-nf7266
-pio run -e nano33iot
-
-.tools/arduinoOTA_osx_darwin_arm64/arduinoOTA \
-  -address 192.168.4.26 \
-  -port 65280 \
-  -username arduino \
-  -password password \
-  -sketch .pio/build/nano33iot/firmware.bin \
-  -upload /sketch \
-  -t 120 \
-  -b
+cd esp32-c6-hud
+pio run -e esp32-c6-hud -t upload
+pio device monitor -b 115200
 ```
 
-**Verified 2026-07-10:** `Sketch uploaded successfully` after web UI WiFi switch.
-
-After reboot the board returns to **hotspot mode**. Use **Back to hotspot** in the UI to switch manually without rebooting.
-
-| OTA setting | Value |
-|-------------|-------|
-| IP | `192.168.4.26` (DHCP; may change) |
-| Port | `65280` |
-| Hostname | `nano33iot-nf7266` |
-| Password | `password` (set in `wifi_secrets.h`) |
-
-### Nano 33 IoT — OTA-only bootstrap (brick recovery)
-
-If the main sketch is broken but you need network access:
+### ESP32-C6 HUD — desktop simulator
 
 ```bash
-pio run -e nano33iot-ota -t upload
+cd esp32-c6-hud
+brew install sdl2   # one-time
+./scripts/run-hud-sim.sh --mock     # demo UI without hardware
+./scripts/run-hud-sim.sh            # live Nano serial feed
 ```
 
-This flashes `src/ota/ota_main.cpp` — WiFi + ArduinoOTA only, no BLE.
-
-### Serial monitor
+### Serial monitor (Nano)
 
 ```bash
 pio device monitor -b 115200
@@ -429,9 +481,9 @@ while True:
 cd esp32-cam-s3-streamer
 pio run -e esp32cam-s3 -t upload
 
-# LCD receiver (C3)
-cd esp32-c3-lcd-display
-pio run -e esp32-c3-lcd -t upload
+# LCD video receiver (S3)
+cd esp32-s3-lcd-display
+pio run -e esp32-s3-lcd -t upload
 ```
 
 ---
@@ -458,19 +510,16 @@ Use pyserial directly with `dtr=True` (see Serial monitor above).
 - Confirm Serial shows `spd=…` lines.
 - Web poll is 250 ms by default; check the timing bar for wheel Hz vs data age.
 
-### Hotspot vs home WiFi
+### Hotspot not reachable
 
-- NINA **cannot** run AP and STA at the same time.
-- Use the web UI **Switch to WiFi for OTA** before uploading from your PC.
-- OTA requires your computer on the **same home WiFi** as the Nano (not on `EUC-NANO`).
+- Confirm you joined `EUC-NANO` / `eucnano1` and open http://192.168.4.1/
+- Check serial for `Hotspot ready @ 192.168.4.1`
 
-### OTA returns Unauthorized
+### HUD simulator shows no telemetry
 
-Password must match `OTA_UPLOAD_PASSWORD` in `wifi_secrets.h` (default `password`).
-
-### OTA upload succeeds but sketch doesn't run
-
-Close any serial monitor before OTA — an immediate USB reset after upload can interrupt flash apply on SAMD.
+- Close other serial monitors (only one client can open the Nano USB port).
+- Confirm Nano has `SERIAL_HUD_STREAM 1` in `config.h` and is flashed.
+- Use `--mock` to verify the UI without hardware: `./scripts/run-hud-sim.sh --mock`
 
 ### WiFi + BLE hang (pre-3.0.1 NINA)
 
@@ -483,18 +532,20 @@ Update NINA to 3.0.1 (see above). On old firmware the sketch falls back to a 12 
 | Component | Status |
 |-----------|--------|
 | Nano BLE + Veteran parser | **Working** — telemetry on Serial and web UI |
+| Nano HUD serial stream | **Working** — feeds desktop HUD simulator |
 | WiFi hotspot + web UI | **Working** — `EUC-NANO` @ 192.168.4.1 |
-| WiFi mode switch + OTA | **Tested** — web button → home WiFi → OTA upload |
 | Direct BLE connect (MAC) | **Working** — `88:25:83:f6:21:0f` |
 | NINA firmware 3.0.1 | **Done** |
+| ESP32-C6 HUD simulator | **Working** — mock + live Nano serial |
+| ESP32-C6 HUD firmware | Built, not field-tested on hardware |
 | ESP32-CAM streamer | Built, not field-tested |
-| ESP32-C3 LCD receiver | Built, not field-tested |
+| ESP32-S3 LCD receiver | Built for S3 + PSRAM, not field-tested |
 
 ### Recommended next steps
 
-1. Flash and bench-test the ESP32 video pair.
-2. Add optional mDNS for OTA hostname instead of hard-coded IP.
-3. Persist last WiFi mode across reboot if desired (currently always boots to hotspot).
+1. Flash and bench-test the ESP32-C6 HUD on hardware.
+2. Flash and bench-test the ESP32 video pair.
+3. Re-add OTA upload for the Nano if desired (currently USB-only).
 
 ---
 
@@ -504,4 +555,3 @@ Update NINA to 3.0.1 (see above). On old firmware the sketch falls back to a 12 
 - [eucWatch Ninebot module](https://github.com/enaon/eucWatch) (original FFE0/FFE1 reference; not used for Apex)
 - [Arduino NINA concurrent WiFi+BLE](https://blog.arduino.cc/2026/03/02/you-can-now-use-wi-fi-and-bluetooth-le-simultaneously-on-arduino-nina-based-boards-heres-how/)
 - [arduino-fwuploader](https://github.com/arduino/arduino-fwuploader)
-- [arduinoOTA](https://github.com/arduino/arduinoOTA)

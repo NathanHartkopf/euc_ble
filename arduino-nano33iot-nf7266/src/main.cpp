@@ -1,6 +1,5 @@
 #include <SPI.h>
 #include <WiFiNINA.h>
-#include <ArduinoOTA.h>
 #include <ArduinoBLE.h>
 #include <string.h>
 
@@ -8,7 +7,6 @@
 #include "config.h"
 #include "veteran_protocol.h"
 #include "web_server.h"
-#include "wifi_secrets.h"
 
 BleAdvertisement g_bleDevices[BLE_SCAN_MAX_DEVICES];
 uint8_t g_bleDeviceCount = 0;
@@ -25,7 +23,6 @@ uint32_t g_telemetryLastGapMs = 0;
 uint32_t g_telemetryAvgGapMs = 0;
 uint32_t g_telemetryLastFrameMs = 0;
 bool g_wifiApMode = true;
-bool g_wifiOtaReady = false;
 
 namespace {
 
@@ -44,10 +41,7 @@ veteran::FrameReassembler frameParser;
 uint32_t reconnectAtMs = 0;
 uint32_t lastWifiAttemptMs = 0;
 bool notificationsReady = false;
-bool otaReady = false;
 bool wifiBleConcurrent = false;
-bool g_wifiRequestSta = false;
-bool g_wifiRequestAp = false;
 bool g_directConnectActive = false;
 uint32_t g_directConnectUntilMs = 0;
 bool g_pendingBootDirectConnect = false;
@@ -93,8 +87,6 @@ void disconnectWifiForBle() {
     WiFi.disconnect();
     delay(250);
   }
-  otaReady = false;
-  g_wifiOtaReady = false;
   g_httpServerStarted = false;
 }
 
@@ -103,8 +95,6 @@ void resetHttpServer() {
 }
 
 bool startAccessPoint() {
-  otaReady = false;
-  g_wifiOtaReady = false;
   resetHttpServer();
   WiFi.disconnect();
   delay(250);
@@ -124,40 +114,16 @@ bool startAccessPoint() {
   return true;
 }
 
-bool startStationWifi() {
-  otaReady = false;
-  g_wifiOtaReady = false;
-  resetHttpServer();
-  WiFi.disconnect();
-  delay(250);
+void requestDirectConnect();
+void beginBleScan();
+bool beginDirectWheelConnect();
 
-  g_wifiApMode = false;
-  Serial.print(F("Connecting to WiFi "));
-  Serial.println(SECRET_SSID);
-  WiFi.begin(SECRET_SSID, SECRET_PASS);
-  lastWifiAttemptMs = 0;
-  return true;
+void onWebScanRequested() {
+  beginBleScan();
 }
 
-void processWifiModeRequests() {
-  if (g_wifiRequestSta) {
-    g_wifiRequestSta = false;
-    startStationWifi();
-    return;
-  }
-
-  if (g_wifiRequestAp) {
-    g_wifiRequestAp = false;
-    startAccessPoint();
-  }
-}
-
-void onWebWifiOtaRequested() {
-  g_wifiRequestSta = true;
-}
-
-void onWebWifiApRequested() {
-  g_wifiRequestAp = true;
+void onWebConnectRequested() {
+  beginDirectWheelConnect();
 }
 
 bool uuidIsFfe0(const String &uuid) {
@@ -386,14 +352,6 @@ void serviceDirectConnectTimeout() {
   reconnectAtMs = millis() + WHEEL_DIRECT_RETRY_MS;
 }
 
-void onWebScanRequested() {
-  beginBleScan();
-}
-
-void onWebConnectRequested() {
-  beginDirectWheelConnect();
-}
-
 const char *connectionStatusText() {
   switch (state) {
     case State::Connected:
@@ -487,7 +445,11 @@ void processTelemetryChunk(const uint8_t *data, size_t length) {
 
   g_wheelTelemetry = frameParser.consumeTelemetry();
   recordTelemetryFrame();
+#if SERIAL_HUD_STREAM
+  veteran::printHudStreamLine(g_wheelTelemetry);
+#else
   veteran::printTelemetry(g_wheelTelemetry);
+#endif
 }
 
 void onTelemetryCharacteristicUpdated(BLEDevice /*device*/, BLECharacteristic characteristic) {
@@ -541,7 +503,10 @@ bool connectToTarget(BLEDevice device, bool direct = false) {
   g_directConnectActive = false;
 
   g_wheelConnected = true;
-  if (device.hasLocalName()) {
+  if (WHEEL_DISPLAY_NAME[0] != '\0') {
+    strncpy(g_wheelName, WHEEL_DISPLAY_NAME, sizeof(g_wheelName) - 1);
+    g_wheelName[sizeof(g_wheelName) - 1] = '\0';
+  } else if (device.hasLocalName()) {
     device.localName().toCharArray(g_wheelName, sizeof(g_wheelName));
   } else {
     g_wheelName[0] = '\0';
@@ -554,123 +519,25 @@ bool connectToTarget(BLEDevice device, bool direct = false) {
   return true;
 }
 
-void connectWifiBlocking() {
-  if (WiFi.status() == WL_CONNECTED) {
-    return;
-  }
-
-  Serial.print(F("WiFi: connecting to "));
-  Serial.println(SECRET_SSID);
-  WiFi.begin(SECRET_SSID, SECRET_PASS);
-
-  const uint32_t deadline = millis() + WIFI_CONNECT_TIMEOUT_MS;
-  while (WiFi.status() != WL_CONNECTED && millis() < deadline) {
-    delay(250);
-    Serial.print('.');
-  }
-  Serial.println();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print(F("WiFi connected, IP: "));
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println(F("WiFi connect timeout"));
-  }
-}
-
-void runBootOtaWindow() {
-  if (WiFi.status() == WL_NO_MODULE) {
-    return;
-  }
-
-  connectWifiBlocking();
-  if (WiFi.status() != WL_CONNECTED) {
-    return;
-  }
-
-  ArduinoOTA.begin(WiFi.localIP(), OTA_HOSTNAME, OTA_UPLOAD_PASSWORD, InternalStorage);
-  otaReady = true;
-  Serial.print(F("OTA window "));
-  Serial.print(OTA_BOOT_WINDOW_MS / 1000);
-  Serial.print(F("s @ "));
-  Serial.println(WiFi.localIP());
-
-  const uint32_t deadline = millis() + OTA_BOOT_WINDOW_MS;
-  while (millis() < deadline) {
-    ArduinoOTA.handle();
-    delay(10);
-  }
-
-  Serial.println(F("OTA window closed"));
-}
-
-void connectWifi() {
-  if (WiFi.status() == WL_CONNECTED) {
-    return;
-  }
-
-  Serial.print(F("WiFi: connecting to "));
-  Serial.println(SECRET_SSID);
-  WiFi.begin(SECRET_SSID, SECRET_PASS);
-}
-
-void ensureOta() {
-  if (g_wifiApMode || WiFi.status() != WL_CONNECTED) {
-    return;
-  }
-
-  if (!otaReady) {
-    ArduinoOTA.begin(WiFi.localIP(), OTA_HOSTNAME, OTA_UPLOAD_PASSWORD, InternalStorage);
-    otaReady = true;
-    g_wifiOtaReady = true;
-    Serial.print(F("ArduinoOTA ready @ "));
-    Serial.println(WiFi.localIP());
-    return;
-  }
-
-  g_wifiOtaReady = true;
-  ArduinoOTA.handle();
-}
-
 void serviceWifiAndWeb() {
   if (!wifiBleConcurrent) {
     return;
   }
 
-  processWifiModeRequests();
-
   const uint32_t now = millis();
 
   if (!wifiWebReady()) {
-    otaReady = false;
-    g_wifiOtaReady = false;
     g_httpServerStarted = false;
-
-    if (g_wifiApMode) {
-      if (now - lastWifiAttemptMs >= WIFI_RETRY_MS) {
-        lastWifiAttemptMs = now;
-        startAccessPoint();
-      }
-      return;
-    }
 
     if (now - lastWifiAttemptMs >= WIFI_RETRY_MS) {
       lastWifiAttemptMs = now;
-      connectWifi();
+      startAccessPoint();
     }
     return;
   }
 
-  if (!g_wifiApMode) {
-    ensureOta();
-  } else {
-    otaReady = false;
-    g_wifiOtaReady = false;
-  }
-
   if (state != State::Connecting) {
-    webServerHandleClient(connectionStatusText(), onWebScanRequested, onWebConnectRequested,
-                          onWebWifiOtaRequested, onWebWifiApRequested);
+    webServerHandleClient(connectionStatusText(), onWebScanRequested, onWebConnectRequested);
   }
 }
 
@@ -705,7 +572,7 @@ void setup() {
   }
 
   if (WiFi.status() == WL_NO_MODULE) {
-    Serial.println(F("WiFiNINA module not found — OTA/web disabled"));
+    Serial.println(F("WiFiNINA module not found — web UI disabled"));
   } else {
     const String ninaFw = WiFi.firmwareVersion();
     Serial.print(F("NINA firmware: "));
@@ -715,9 +582,7 @@ void setup() {
       Serial.println(F("NINA supports concurrent WiFi+BLE"));
       startAccessPoint();
     } else {
-      Serial.println(F("NINA < 3.0.1: boot OTA window, then BLE-only (no web UI)"));
-      runBootOtaWindow();
-      disconnectWifiForBle();
+      Serial.println(F("NINA < 3.0.1: BLE-only (no web UI)"));
     }
   }
 
@@ -728,7 +593,7 @@ void setup() {
     }
   }
 
-  Serial.println(F("Nano 33 IoT — BLE scanner web UI + OTA"));
+  Serial.println(F("Nano 33 IoT — BLE + Veteran telemetry"));
   Serial.print(F("Hotspot: "));
   Serial.print(WIFI_AP_SSID);
   Serial.print(F(" / "));

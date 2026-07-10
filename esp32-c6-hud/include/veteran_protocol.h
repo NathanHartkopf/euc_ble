@@ -1,6 +1,12 @@
 #pragma once
 
+#ifdef ARDUINO
 #include <Arduino.h>
+#else
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+#endif
 
 namespace veteran {
 
@@ -34,8 +40,7 @@ inline int16_t readBeI16(const uint8_t *data, size_t offset) {
 inline uint32_t readWordSwapped32(const uint8_t *data, size_t offset) {
   return (static_cast<uint32_t>(data[offset + 2]) << 24) |
          (static_cast<uint32_t>(data[offset + 3]) << 16) |
-         (static_cast<uint32_t>(data[offset]) << 8) |
-         data[offset + 1];
+         (static_cast<uint32_t>(data[offset]) << 8) | data[offset + 1];
 }
 
 inline uint32_t crc32(const uint8_t *data, size_t length) {
@@ -89,9 +94,7 @@ inline bool parseRealtimeFrame(const uint8_t *frame, size_t length, Telemetry &o
 
 class FrameReassembler {
  public:
-  void reset() {
-    length_ = 0;
-  }
+  void reset() { length_ = 0; }
 
   void feed(const uint8_t *data, size_t dataLen) {
     for (size_t i = 0; i < dataLen; i++) {
@@ -100,9 +103,7 @@ class FrameReassembler {
     }
   }
 
-  bool hasTelemetry() const {
-    return pending_.valid;
-  }
+  bool hasTelemetry() const { return pending_.valid; }
 
   Telemetry consumeTelemetry() {
     Telemetry result = pending_;
@@ -127,7 +128,6 @@ class FrameReassembler {
       length_ = 0;
       return;
     }
-
     memmove(buffer_, buffer_ + 1, length_ - 1);
     length_--;
   }
@@ -149,7 +149,6 @@ class FrameReassembler {
       }
       return;
     }
-
     if (magicAt > 0) {
       memmove(buffer_, buffer_ + magicAt, length_ - magicAt);
       length_ -= magicAt;
@@ -170,8 +169,7 @@ class FrameReassembler {
                               (static_cast<uint32_t>(frame[declaredLen + 1]) << 16) |
                               (static_cast<uint32_t>(frame[declaredLen + 2]) << 8) |
                               frame[declaredLen + 3];
-    const uint32_t actual = crc32(frame, declaredLen);
-    return actual == expected;
+    return crc32(frame, declaredLen) == expected;
   }
 
   void dropFrame(size_t totalBytes) {
@@ -179,7 +177,6 @@ class FrameReassembler {
       length_ = 0;
       return;
     }
-
     memmove(buffer_, buffer_ + totalBytes, length_ - totalBytes);
     length_ -= totalBytes;
   }
@@ -216,28 +213,8 @@ class FrameReassembler {
   }
 };
 
-inline void printTelemetry(const Telemetry &t) {
-  Serial.print(F("spd="));
-  Serial.print(t.speed_kmh, 1);
-  Serial.print(F(" km/h  amp="));
-  Serial.print(t.current_a, 1);
-  Serial.print(F(" A  volt="));
-  Serial.print(t.voltage_v, 1);
-  Serial.print(F(" V  batt="));
-  Serial.print(t.battery_pct);
-  Serial.print(F("%  tmp="));
-  Serial.print(t.temp_c, 1);
-  Serial.print(F(" C  trip="));
-  Serial.print(t.trip_m / 1000.0f, 2);
-  Serial.print(F(" km  odo="));
-  Serial.print(t.total_m / 1000.0f, 1);
-  Serial.print(F(" km  fw="));
-  Serial.print(t.firmware_ver);
-  Serial.print(F("  chg="));
-  Serial.println(t.charging ? F("yes") : F("no"));
-}
-
 inline void printHudStreamLine(const Telemetry &t) {
+#ifdef ARDUINO
   Serial.print(F("HUD,"));
   Serial.print(t.speed_kmh, 2);
   Serial.print(',');
@@ -250,6 +227,9 @@ inline void printHudStreamLine(const Telemetry &t) {
   Serial.print(t.temp_c, 1);
   Serial.print(',');
   Serial.println(t.charging ? 1 : 0);
+#else
+  (void)t;
+#endif
 }
 
 }  // namespace veteran

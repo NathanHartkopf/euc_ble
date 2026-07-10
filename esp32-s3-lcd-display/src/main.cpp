@@ -17,6 +17,11 @@ FrameReceiver receiver;
 
 int16_t crop_top = 0;
 
+#if USE_DUAL_CORE_PIPELINE
+SemaphoreHandle_t frame_ready_sem = nullptr;
+TaskHandle_t network_task_handle = nullptr;
+#endif
+
 int jpegDrawCallback(JPEGDRAW *draw) {
   const int16_t y = draw->y - crop_top;
   if (y + draw->iHeight <= 0 || y >= VIDEO_FRAME_HEIGHT) {
@@ -66,11 +71,51 @@ void drawFrame(const uint8_t *data, size_t size) {
   jpeg.close();
 }
 
+void logPlatformInfo() {
+#if defined(BOARD_HAS_PSRAM) && USE_PSRAM_BUFFERS
+  Serial.printf("PSRAM: %u bytes free\n", ESP.getFreePsram());
+#endif
+  Serial.printf("Chip: %s @ %u MHz, cores: %d\n", ESP.getChipModel(), getCpuFrequencyMhz(),
+                ESP.getChipCores());
+}
+
+#if USE_DUAL_CORE_PIPELINE
+void networkTask(void *param) {
+  (void)param;
+  for (;;) {
+    while (receiver.poll()) {
+      xSemaphoreGive(frame_ready_sem);
+      ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    }
+    vTaskDelay(1);
+  }
+}
+
+void displayTask(void *param) {
+  (void)param;
+  for (;;) {
+    if (xSemaphoreTake(frame_ready_sem, portMAX_DELAY) != pdTRUE) {
+      continue;
+    }
+
+    const uint8_t *data = nullptr;
+    size_t size = 0;
+    if (receiver.acquireDisplayFrame(&data, &size)) {
+      drawFrame(data, size);
+      receiver.releaseDisplayFrame();
+    }
+
+    xTaskNotifyGive(network_task_handle);
+  }
+}
+#endif
+
 }  // namespace
 
 void setup() {
   Serial.begin(115200);
   delay(200);
+  logPlatformInfo();
 
   initIoExpanderBacklight();
 
@@ -84,6 +129,7 @@ void setup() {
     }
   }
 
+  configureDisplayBus(bus);
   gfx->fillScreen(RGB565_BLACK);
   showStatus("WiFi...", RGB565_YELLOW);
 
@@ -102,14 +148,28 @@ void setup() {
   }
 
   showStatus("Waiting video", RGB565_GREEN);
+
+#if USE_DUAL_CORE_PIPELINE
+  frame_ready_sem = xSemaphoreCreateBinary();
+  xTaskCreatePinnedToCore(networkTask, "video_net", 6144, nullptr, 2, &network_task_handle,
+                          NETWORK_TASK_CORE);
+  xTaskCreatePinnedToCore(displayTask, "video_lcd", 8192, nullptr, 1, nullptr, DISPLAY_TASK_CORE);
+  Serial.println("Dual-core video pipeline active");
+#endif
 }
 
 void loop() {
+#if USE_DUAL_CORE_PIPELINE
+  vTaskDelay(portMAX_DELAY);
+#else
   while (receiver.poll()) {
   }
 
-  if (receiver.hasCompleteFrame()) {
-    drawFrame(receiver.frameData(), receiver.frameSize());
-    receiver.releaseFrame();
+  const uint8_t *data = nullptr;
+  size_t size = 0;
+  if (receiver.acquireDisplayFrame(&data, &size)) {
+    drawFrame(data, size);
+    receiver.releaseDisplayFrame();
   }
+#endif
 }

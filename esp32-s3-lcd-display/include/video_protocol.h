@@ -26,4 +26,4 @@ typedef struct {
 } VideoPacketHeader;
 #pragma pack(pop)
 
-static_assert(sizeof(VideoPacketHeader) == 16, "VideoPacketHeader must be 16 bytes");
+static_assert(sizeof(VideoPacketHeader) == 14, "VideoPacketHeader must be 14 bytes");

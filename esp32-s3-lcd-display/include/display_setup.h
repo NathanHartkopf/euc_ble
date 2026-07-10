@@ -13,3 +13,9 @@ inline Arduino_GFX *createDisplay(Arduino_DataBus *bus) {
   return new Arduino_ST7789(bus, LCD_PIN_RST, 1 /* landscape */, true /* IPS */, 172, 320,
                             LCD_COL_OFFSET_1, 0, LCD_COL_OFFSET_2, 0);
 }
+
+inline void configureDisplayBus(Arduino_DataBus *bus) {
+  if (bus) {
+    bus->begin();
+  }
+}

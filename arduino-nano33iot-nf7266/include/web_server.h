@@ -19,7 +19,6 @@ extern uint32_t g_telemetryLastGapMs;
 extern uint32_t g_telemetryAvgGapMs;
 extern uint32_t g_telemetryLastFrameMs;
 extern bool g_wifiApMode;
-extern bool g_wifiOtaReady;
 
 bool wifiWebReady();
 
@@ -110,18 +109,14 @@ inline void webPrintTelemetryJson(WiFiClient &client) {
 }
 
 inline void webPrintWifiJson(WiFiClient &client) {
-  client.print(F(",\"wifi\":{\"mode\":\""));
-  client.print(g_wifiApMode ? F("ap") : F("sta"));
-  client.print(F("\",\"ssid\":\""));
+  client.print(F(",\"wifi\":{\"mode\":\"ap\",\"ssid\":\""));
   webJsonPrintEscaped(client, WiFi.SSID());
   client.print(F("\",\"ip\":\""));
   const IPAddress ip = WiFi.localIP();
   char ipBuf[16];
   snprintf(ipBuf, sizeof(ipBuf), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
   webJsonPrintEscaped(client, ipBuf);
-  client.print(F("\",\"ota_ready\":"));
-  client.print(g_wifiOtaReady ? F("true") : F("false"));
-  client.print(F("}"));
+  client.print(F("\"}"));
 }
 
 inline void webSendJsonDevices(WiFiClient &client, const char *connectionStatus) {
@@ -200,11 +195,10 @@ inline void webSendHtmlPage(WiFiClient &client) {
   client.println(F(".metric span{font-size:1.25rem;font-weight:600}"));
   client.println(F("#timing{margin-top:.75rem;font-size:.8rem;color:#888;line-height:1.4}"));
   client.println(F("#wifiBar{margin:.75rem 0;padding:.6rem .75rem;border:1px solid #333;border-radius:.5rem;background:#1a1a1a;font-size:.85rem}"));
-  client.println(F("#wifiBar button{margin-left:.5rem}"));
   client.println(F(".hidden{display:none}"));
   client.println(F("</style></head><body>"));
   client.println(F("<h1>Nano 33 IoT — BLE Scanner</h1>"));
-  client.println(F("<div id=wifiBar><span id=wifiInfo class=muted>WiFi…</span><button id=wifiMode class=hidden></button></div>"));
+  client.println(F("<div id=wifiBar><span id=wifiInfo class=muted>WiFi…</span></div>"));
   client.println(F("<p><button id=scan>Scan</button> <button id=connect>Connect</button> <span id=status class=muted>Idle</span></p>"));
   client.println(F("<div id=telemetry class=hidden>"));
   client.println(F("<div id=speedometer><span id=speed_mph>—</span><span class=speed-unit>mph</span></div>"));
@@ -222,16 +216,14 @@ inline void webSendHtmlPage(WiFiClient &client) {
   client.println(F("<tbody id=rows><tr><td colspan=5 class=muted>No devices yet — press Scan</td></tr></tbody>"));
   client.println(F("</table><script>"));
   client.println(F("const statusEl=document.getElementById('status');const rowsEl=document.getElementById('rows');"));
-  client.println(F("const wifiInfoEl=document.getElementById('wifiInfo');const wifiModeBtn=document.getElementById('wifiMode');"));
+  client.println(F("const wifiInfoEl=document.getElementById('wifiInfo');"));
   client.println(F("const telEl=document.getElementById('telemetry');const wheelEl=document.getElementById('wheel');"));
   client.println(F("const speedEl=document.getElementById('speed_mph');const timingEl=document.getElementById('timing');const WEB_POLL_MS="));
   client.print(WEB_REFRESH_MS);
   client.println(F(";const KMH_TO_MPH=0.621371;let lastFetchAt=0,lastFrameCount=0;"));
   client.println(F("const kmToMi=v=>v*KMH_TO_MPH;const cToF=v=>v*9/5+32;"));
   client.println(F("function setTel(id,v){document.getElementById(id).textContent=v;}"));
-  client.println(F("function updateWifiBar(w){if(!w)return;"));
-  client.println(F("if(w.mode==='ap'){wifiInfoEl.textContent=`Hotspot ${w.ssid} @ ${w.ip}`;wifiModeBtn.className='';wifiModeBtn.textContent='Switch to WiFi for OTA';}"));
-  client.println(F("else{wifiInfoEl.textContent=`WiFi ${w.ssid} @ ${w.ip}${w.ota_ready?' · OTA ready':''}`;wifiModeBtn.className='';wifiModeBtn.textContent='Back to hotspot';}}"));
+  client.println(F("function updateWifiBar(w){if(!w)return;wifiInfoEl.textContent=`Hotspot ${w.ssid} @ ${w.ip}`;}"));
   client.println(F("function updateTiming(t){if(!timingEl)return;const now=Date.now();"));
   client.println(F("const webPollMs=lastFetchAt?(now-lastFetchAt):WEB_POLL_MS;const framesDelta=lastFrameCount?(t.frame_count-lastFrameCount):0;"));
   client.println(F("const wheelHz=t.avg_gap_ms>0?(1000/t.avg_gap_ms):0;const ageMs=(t.age_ms||0)+(now-(window._fetchedAt||now));"));
@@ -253,9 +245,6 @@ inline void webSendHtmlPage(WiFiClient &client) {
   client.println(F("try{await fetch('/api/scan',{method:'POST'});}catch(e){} refresh();};"));
   client.println(F("document.getElementById('connect').onclick=async()=>{statusEl.textContent='Connecting…';"));
   client.println(F("try{await fetch('/api/connect',{method:'POST'});}catch(e){} refresh();};"));
-  client.println(F("wifiModeBtn.onclick=async()=>{const ap=wifiModeBtn.textContent.startsWith('Back');"));
-  client.println(F("if(!confirm(ap?'Return to hotspot mode? You will reconnect to EUC-NANO.':'Switch to home WiFi for OTA? This hotspot will stop — join your home WiFi and use the new IP shown on Serial.'))return;"));
-  client.println(F("wifiInfoEl.textContent='Switching…';try{await fetch(ap?'/api/wifi/ap':'/api/wifi/ota',{method:'POST'});}catch(e){} refresh();};"));
   client.println(F("refresh(); setInterval(refresh,"));
   client.print(WEB_REFRESH_MS);
   client.println(F(");"));
@@ -282,8 +271,7 @@ inline void webServerEnsureStarted() {
 }
 
 inline void webServerHandleClient(const char *connectionStatus, void (*onScanRequested)(),
-                                  void (*onConnectRequested)(), void (*onWifiOtaRequested)(),
-                                  void (*onWifiApRequested)()) {
+                                  void (*onConnectRequested)()) {
   webServerEnsureStarted();
 
   WiFiClient client = g_httpServer.available();
@@ -304,16 +292,6 @@ inline void webServerHandleClient(const char *connectionStatus, void (*onScanReq
 
   if (requestLine.startsWith(F("GET /api/devices"))) {
     webSendJsonDevices(client, connectionStatus);
-  } else if (requestLine.startsWith(F("POST /api/wifi/ota"))) {
-    if (onWifiOtaRequested) {
-      onWifiOtaRequested();
-    }
-    webSendScanResponse(client);
-  } else if (requestLine.startsWith(F("POST /api/wifi/ap"))) {
-    if (onWifiApRequested) {
-      onWifiApRequested();
-    }
-    webSendScanResponse(client);
   } else if (requestLine.startsWith(F("POST /api/connect"))) {
     if (onConnectRequested) {
       onConnectRequested();
