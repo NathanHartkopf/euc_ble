@@ -1,49 +1,94 @@
 #pragma once
 
-// Target: Waveshare ESP32-S3-LCD-1.47 (16 MB flash, 8 MB OPI PSRAM, dual-core @ 240 MHz).
-// Set the active profile in platformio.ini build_flags.
+// Board profiles — set the active one in platformio.ini build_flags.
 
-#if defined(BOARD_WAVESHARE_ESP32_S3_LCD_147)
+#if defined(BOARD_WAVESHARE_ESP32_S3_TOUCH_LCD_147)
+// Waveshare ESP32-S3-Touch-LCD-1.47 (JD9853, USB-C, capacitive touch).
 #define IO_EXPANDER_I2C_SDA -1
 #define IO_EXPANDER_I2C_SCL -1
 #define IO_EXPANDER_I2C_ADDR 0
 #define USE_IO_EXPANDER_BACKLIGHT 0
-#elif defined(BOARD_WAVESHARE_ESP32_C3_LCD_147)
-#define IO_EXPANDER_I2C_SDA 3
-#define IO_EXPANDER_I2C_SCL 4
-#define IO_EXPANDER_I2C_ADDR 0x24
-#define USE_IO_EXPANDER_BACKLIGHT 1
-#elif defined(BOARD_WAVESHARE_ESP32_C6_LCD_147)
-#define USE_IO_EXPANDER_BACKLIGHT 0
-#else
-#error "Select a board profile in platformio.ini build_flags"
-#endif
+#define LCD_PIN_MOSI 39
+#define LCD_PIN_SCLK 38
+#define LCD_PIN_CS 21
+#define LCD_PIN_DC 45
+#define LCD_PIN_RST 47
+#define LCD_PIN_RST_AUX 40
+#define LCD_PIN_BL 46
+#define LCD_IS_IPS 0
+#define LCD_NATIVE_ROTATION 0
+#define LCD_NATIVE_WIDTH 172
+#define LCD_NATIVE_HEIGHT 320
+#define LCD_LANDSCAPE_ROTATION 1
+#define LCD_USE_JD9853_INIT 1
+#define LCD_BACKLIGHT_PWM 230
+#define LCD_SPI_FREQUENCY_HZ 40000000
 
-// ST7789 SPI — Waveshare ESP32-S3-LCD-1.47 pinout.
-#if defined(BOARD_WAVESHARE_ESP32_S3_LCD_147)
+#elif defined(BOARD_WAVESHARE_ESP32_S3_LCD_147)
+// Waveshare ESP32-S3-LCD-1.47 (ST7789, USB-A).
+#define IO_EXPANDER_I2C_SDA -1
+#define IO_EXPANDER_I2C_SCL -1
+#define IO_EXPANDER_I2C_ADDR 0
+#define USE_IO_EXPANDER_BACKLIGHT 0
 #define LCD_PIN_MOSI 45
 #define LCD_PIN_SCLK 40
 #define LCD_PIN_CS 42
 #define LCD_PIN_DC 41
 #define LCD_PIN_RST 39
 #define LCD_PIN_BL 48
-#elif defined(BOARD_WAVESHARE_ESP32_C3_LCD_147) || defined(BOARD_WAVESHARE_ESP32_C6_LCD_147)
+#define LCD_IS_IPS 1
+#define LCD_NATIVE_ROTATION 1
+#define LCD_NATIVE_WIDTH 172
+#define LCD_NATIVE_HEIGHT 320
+#define LCD_LANDSCAPE_ROTATION 1
+#define LCD_USE_JD9853_INIT 0
+#define LCD_BACKLIGHT_PWM 230
+#define LCD_SPI_FREQUENCY_HZ 40000000
+
+#elif defined(BOARD_WAVESHARE_ESP32_C3_LCD_147)
+#define IO_EXPANDER_I2C_SDA 3
+#define IO_EXPANDER_I2C_SCL 4
+#define IO_EXPANDER_I2C_ADDR 0x24
+#define USE_IO_EXPANDER_BACKLIGHT 1
 #define LCD_PIN_MOSI 6
 #define LCD_PIN_SCLK 7
 #define LCD_PIN_CS 14
 #define LCD_PIN_DC 15
 #define LCD_PIN_RST 21
 #define LCD_PIN_BL 22
-#endif
-
-// ST7789 172x320 offsets for the 1.47" panel.
-#define LCD_COL_OFFSET_1 34
-#define LCD_COL_OFFSET_2 34
-
+#define LCD_IS_IPS 1
+#define LCD_NATIVE_ROTATION 1
+#define LCD_NATIVE_WIDTH 172
+#define LCD_NATIVE_HEIGHT 320
+#define LCD_LANDSCAPE_ROTATION 1
+#define LCD_USE_JD9853_INIT 0
 #define LCD_BACKLIGHT_PWM 128
 #define LCD_SPI_FREQUENCY_HZ 40000000
 
-// S3 has headroom for PSRAM frame buffers and a future LVGL overlay layer.
+#elif defined(BOARD_WAVESHARE_ESP32_C6_LCD_147)
+#define USE_IO_EXPANDER_BACKLIGHT 0
+#define LCD_PIN_MOSI 6
+#define LCD_PIN_SCLK 7
+#define LCD_PIN_CS 14
+#define LCD_PIN_DC 15
+#define LCD_PIN_RST 21
+#define LCD_PIN_BL 22
+#define LCD_IS_IPS 1
+#define LCD_NATIVE_ROTATION 1
+#define LCD_NATIVE_WIDTH 172
+#define LCD_NATIVE_HEIGHT 320
+#define LCD_LANDSCAPE_ROTATION 1
+#define LCD_USE_JD9853_INIT 0
+#define LCD_BACKLIGHT_PWM 128
+#define LCD_SPI_FREQUENCY_HZ 40000000
+
+#else
+#error "Select a board profile in platformio.ini build_flags"
+#endif
+
+#define LCD_COL_OFFSET_1 34
+#define LCD_COL_OFFSET_2 34
+
 #define USE_PSRAM_BUFFERS 1
 #define USE_DUAL_CORE_PIPELINE 1
 #define NETWORK_TASK_CORE 0

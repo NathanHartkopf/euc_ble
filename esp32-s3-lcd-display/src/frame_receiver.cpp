@@ -1,164 +1,174 @@
 #include "frame_receiver.h"
 
-#include <WiFiUdp.h>
+#include <ArduinoWebsockets.h>
+#include <cstring>
 
-#include "config.h"
 #include "psram_alloc.h"
 
 namespace {
 
-WiFiUDP g_udp;
-constexpr size_t kMaxChunkPayload = VIDEO_UDP_PAYLOAD_MAX - sizeof(VideoPacketHeader);
+using namespace websockets;
 
 }  // namespace
 
 FrameReceiver::FrameReceiver() {
-#if USE_PSRAM_BUFFERS
-  assembly_buffer_ = static_cast<uint8_t *>(psramAlloc(kBufferSize));
-  for (int i = 0; i < DISPLAY_FRAME_SLOTS; i++) {
-    display_buffers_[i] = static_cast<uint8_t *>(psramAlloc(kBufferSize));
-  }
-#else
-  assembly_buffer_ = new uint8_t[kBufferSize];
-  display_buffers_[0] = assembly_buffer_;
-#endif
+  frame_buffer_ = static_cast<uint8_t *>(psramAlloc(kBufferSize));
+  decode_buffer_ = static_cast<uint8_t *>(psramAlloc(kBufferSize));
+  buffer_mutex_ = xSemaphoreCreateMutex();
+  ws_client_ = new WebsocketsClient();
 }
 
 FrameReceiver::~FrameReceiver() {
-#if USE_PSRAM_BUFFERS
-  psramFree(assembly_buffer_);
-  for (int i = 0; i < DISPLAY_FRAME_SLOTS; i++) {
-    psramFree(display_buffers_[i]);
+  if (ws_client_) {
+    auto *client = static_cast<WebsocketsClient *>(ws_client_);
+    client->close();
+    delete client;
+    ws_client_ = nullptr;
   }
-#else
-  delete[] assembly_buffer_;
-#endif
+
+  if (buffer_mutex_) {
+    vSemaphoreDelete(buffer_mutex_);
+    buffer_mutex_ = nullptr;
+  }
+
+  psramFree(frame_buffer_);
+  psramFree(decode_buffer_);
 }
 
-bool FrameReceiver::begin(uint16_t port) {
-#if USE_PSRAM_BUFFERS
-  if (!assembly_buffer_) {
+bool FrameReceiver::ensureConnected() {
+  auto *client = static_cast<WebsocketsClient *>(ws_client_);
+  if (!client) {
     return false;
   }
-  for (int i = 0; i < DISPLAY_FRAME_SLOTS; i++) {
-    if (!display_buffers_[i]) {
-      return false;
+
+  if (ws_connected_) {
+    return true;
+  }
+
+  const String url =
+      String("ws://") + VIDEO_CAM_HOST + ":" + String(VIDEO_WS_PORT) + "/";
+  if (!client->connect(url.c_str())) {
+    return false;
+  }
+
+  ws_connected_ = true;
+  Serial.println("WebSocket connected");
+  return true;
+}
+
+bool FrameReceiver::begin() {
+  if (!frame_buffer_ || !decode_buffer_ || !buffer_mutex_ || !ws_client_) {
+    return false;
+  }
+
+  auto *client = static_cast<WebsocketsClient *>(ws_client_);
+  client->onMessage([this](WebsocketsMessage message) {
+    if (!message.isBinary()) {
+      return;
     }
-  }
-#else
-  if (!assembly_buffer_) {
-    return false;
-  }
-#endif
-  return g_udp.begin(port);
-}
+    handleBinaryMessage(reinterpret_cast<const uint8_t *>(message.c_str()), message.length());
+  });
 
-void FrameReceiver::resetAssembly() {
-  expected_chunks_ = 0;
-  received_chunks_ = 0;
-  assembly_offset_ = 0;
-  assembly_ready_ = false;
-  memset(chunk_received_, 0, sizeof(chunk_received_));
-}
+  client->onEvent([this](WebsocketsEvent event, String) {
+    if (event == WebsocketsEvent::ConnectionClosed) {
+      ws_connected_ = false;
+      Serial.println("WebSocket disconnected");
+    }
+  });
 
-bool FrameReceiver::copyReadyFrame() {
-#if !USE_PSRAM_BUFFERS
-  readable_slot_ = 0;
-  display_sizes_[0] = assembly_offset_;
-  return true;
-#else
-  if (slot_busy_[write_slot_]) {
-  drop_frame:
-    resetAssembly();
-    return false;
-  }
-
-  memcpy(display_buffers_[write_slot_], assembly_buffer_, assembly_offset_);
-  display_sizes_[write_slot_] = assembly_offset_;
-  readable_slot_ = write_slot_;
-  slot_busy_[write_slot_] = true;
-  write_slot_ = (write_slot_ + 1) % DISPLAY_FRAME_SLOTS;
-  resetAssembly();
-  return true;
-#endif
-}
-
-bool FrameReceiver::poll() {
-  int packet_size = g_udp.parsePacket();
-  if (packet_size <= 0) {
-    return false;
-  }
-
-  uint8_t packet[VIDEO_UDP_PAYLOAD_MAX];
-  const int read_len = g_udp.read(packet, sizeof(packet));
-  if (read_len < static_cast<int>(sizeof(VideoPacketHeader))) {
-    return false;
-  }
-
-  VideoPacketHeader header;
-  memcpy(&header, packet, sizeof(header));
-
-  if (header.magic != VIDEO_MAGIC || header.payload_size == 0) {
-    return false;
-  }
-
-  const int expected_len = static_cast<int>(sizeof(VideoPacketHeader) + header.payload_size);
-  if (read_len < expected_len || header.chunk_count == 0 || header.chunk_count > 256) {
-    return false;
-  }
-
-  if (header.chunk_index >= header.chunk_count) {
-    return false;
-  }
-
-  if (header.frame_id != active_frame_id_) {
-    active_frame_id_ = header.frame_id;
-    resetAssembly();
-    expected_chunks_ = header.chunk_count;
-  }
-
-  if (chunk_received_[header.chunk_index]) {
-    return false;
-  }
-
-  const size_t offset = static_cast<size_t>(header.chunk_index) * kMaxChunkPayload;
-  if (offset + header.payload_size > kBufferSize) {
-    return false;
-  }
-
-  memcpy(assembly_buffer_ + offset, packet + sizeof(VideoPacketHeader), header.payload_size);
-  chunk_received_[header.chunk_index] = 1;
-  received_chunks_++;
-
-  if (header.chunk_index == header.chunk_count - 1) {
-    assembly_offset_ = offset + header.payload_size;
-  }
-
-  if (received_chunks_ == expected_chunks_) {
-    assembly_ready_ = true;
-    return copyReadyFrame();
-  }
-
-  return false;
-}
-
-bool FrameReceiver::acquireDisplayFrame(const uint8_t **data, size_t *size) {
-  if (readable_slot_ < 0) {
-    return false;
-  }
-
-  *data = display_buffers_[readable_slot_];
-  *size = display_sizes_[readable_slot_];
   return true;
 }
 
-void FrameReceiver::releaseDisplayFrame() {
-  if (readable_slot_ < 0) {
+void FrameReceiver::handleBinaryMessage(const uint8_t *data, size_t len) {
+  if (len <= VIDEO_FRAME_HEADER_SIZE) {
     return;
   }
 
-#if USE_PSRAM_BUFFERS
-  slot_busy_[readable_slot_] = false;
-#endif
-  readable_slot_ = -1;
+  uint32_t frame_id = 0;
+  memcpy(&frame_id, data, VIDEO_FRAME_HEADER_SIZE);
+
+  const uint8_t *jpeg = data + VIDEO_FRAME_HEADER_SIZE;
+  const size_t jpeg_len = len - VIDEO_FRAME_HEADER_SIZE;
+  if (jpeg_len == 0 || jpeg_len > kBufferSize) {
+    return;
+  }
+
+  if (xSemaphoreTake(buffer_mutex_, pdMS_TO_TICKS(5)) != pdTRUE) {
+    return;
+  }
+
+  if (frame_id <= last_drawn_frame_id_) {
+    xSemaphoreGive(buffer_mutex_);
+    return;
+  }
+
+  if (!frame_pending_ || frame_id > pending_frame_id_) {
+    memcpy(frame_buffer_, jpeg, jpeg_len);
+    frame_size_ = jpeg_len;
+    pending_frame_id_ = frame_id;
+    frame_pending_ = true;
+  }
+
+  xSemaphoreGive(buffer_mutex_);
+}
+
+bool FrameReceiver::poll() {
+  auto *client = static_cast<WebsocketsClient *>(ws_client_);
+  if (!client) {
+    return false;
+  }
+
+  if (!ws_connected_) {
+    static uint32_t last_connect_attempt_ms = 0;
+    const uint32_t now = millis();
+    if (now - last_connect_attempt_ms >= 1000) {
+      last_connect_attempt_ms = now;
+      ensureConnected();
+    }
+    return false;
+  }
+
+  client->poll();
+
+  if (xSemaphoreTake(buffer_mutex_, 0) != pdTRUE) {
+    return false;
+  }
+
+  const bool ready = frame_pending_ && pending_frame_id_ > last_drawn_frame_id_;
+  xSemaphoreGive(buffer_mutex_);
+  return ready;
+}
+
+bool FrameReceiver::acquireDisplayFrame(const uint8_t **data, size_t *size, uint32_t *frame_id) {
+  if (xSemaphoreTake(buffer_mutex_, portMAX_DELAY) != pdTRUE) {
+    return false;
+  }
+
+  if (!frame_pending_ || pending_frame_id_ <= last_drawn_frame_id_) {
+    xSemaphoreGive(buffer_mutex_);
+    return false;
+  }
+
+  memcpy(decode_buffer_, frame_buffer_, frame_size_);
+  *data = decode_buffer_;
+  *size = frame_size_;
+  *frame_id = pending_frame_id_;
+  xSemaphoreGive(buffer_mutex_);
+  return true;
+}
+
+void FrameReceiver::releaseDisplayFrame(uint32_t frame_id) {
+  if (xSemaphoreTake(buffer_mutex_, portMAX_DELAY) != pdTRUE) {
+    return;
+  }
+
+  if (frame_id > last_drawn_frame_id_) {
+    last_drawn_frame_id_ = frame_id;
+  }
+
+  if (pending_frame_id_ <= last_drawn_frame_id_) {
+    frame_pending_ = false;
+  }
+
+  xSemaphoreGive(buffer_mutex_);
 }

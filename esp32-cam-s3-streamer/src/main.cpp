@@ -1,124 +1,239 @@
 #include <Arduino.h>
+#include <ArduinoWebsockets.h>
 #include <WiFi.h>
-#include <WiFiUdp.h>
+#include <esp_system.h>
+#include <esp_wifi.h>
 
+#include "board_config.h"
+#include "camera_setup.h"
 #include "config.h"
+#include "status_led.h"
 #include "video_protocol.h"
 #include "esp_camera.h"
-#include "camera_pins.h"
 
-WiFiUDP udp;
+using namespace websockets;
+
+WebsocketsServer ws_server;
+WebsocketsClient ws_client;
+
+bool ws_client_connected = false;
+bool ap_ready = false;
+
 uint32_t frame_id = 0;
+uint8_t *send_buffer = nullptr;
 
-bool initCamera() {
-  camera_config_t config = {};
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer = LEDC_TIMER_0;
-  config.pin_d0 = Y2_GPIO_NUM;
-  config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM;
-  config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM;
-  config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM;
-  config.pin_d7 = Y9_GPIO_NUM;
-  config.pin_xclk = XCLK_GPIO_NUM;
-  config.pin_pclk = PCLK_GPIO_NUM;
-  config.pin_vsync = VSYNC_GPIO_NUM;
-  config.pin_href = HREF_GPIO_NUM;
-  config.pin_sccb_sda = SIOD_GPIO_NUM;
-  config.pin_sccb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn = PWDN_GPIO_NUM;
-  config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = CAMERA_XCLK_HZ;
-  config.frame_size = FRAMESIZE_QVGA;
-  config.pixel_format = PIXFORMAT_JPEG;
-  config.grab_mode = CAMERA_GRAB_LATEST;
-  config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = CAMERA_JPEG_QUALITY;
-  config.fb_count = 2;
+constexpr uint8_t kApChannel = 1;
+constexpr uint8_t kApMaxClients = 4;
+constexpr uint32_t kApSettleMs = 400;
+constexpr int kApRetryCount = 5;
 
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("Camera init failed: 0x%x\n", err);
-    return false;
-  }
+bool initWifiAp();
 
-  sensor_t *sensor = esp_camera_sensor_get();
-  if (sensor) {
-    sensor->set_vflip(sensor, 1);
-    sensor->set_hmirror(sensor, 0);
-  }
-
-  return true;
+bool restoreWifiAp() {
+  ap_ready = initWifiAp();
+  return ap_ready;
 }
+
+void listenStreamServer() { ws_server.listen(VIDEO_WS_PORT); }
 
 bool initWifiAp() {
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+
   WiFi.mode(WIFI_AP);
-  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1),
-                    IPAddress(255, 255, 255, 0));
-  if (!WiFi.softAP(VIDEO_WIFI_SSID, VIDEO_WIFI_PASSWORD, 1, 0, 4)) {
-    Serial.println("Failed to start WiFi AP");
+  WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+
+  if (!WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1),
+                         IPAddress(255, 255, 255, 0))) {
+    Serial.println("softAPConfig failed");
+  }
+
+  for (int attempt = 1; attempt <= kApRetryCount; attempt++) {
+    if (WiFi.softAP(VIDEO_WIFI_SSID, VIDEO_WIFI_PASSWORD, kApChannel, 0, kApMaxClients)) {
+      delay(kApSettleMs);
+      const IPAddress ip = WiFi.softAPIP();
+      if (ip != IPAddress(0, 0, 0, 0)) {
+        Serial.printf("AP ready: %s @ %s (attempt %d)\n", VIDEO_WIFI_SSID, ip.toString().c_str(),
+                      attempt);
+        return true;
+      }
+      Serial.printf("AP started but IP not assigned (attempt %d)\n", attempt);
+    } else {
+      Serial.printf("softAP failed (attempt %d)\n", attempt);
+    }
+
+    WiFi.softAPdisconnect(true);
+    delay(300);
+  }
+
+  return false;
+}
+
+bool ensureCamera() {
+  if (cameraEnsure(ap_ready, !ws_client_connected, restoreWifiAp, listenStreamServer)) {
+    if (ws_client_connected) {
+      statusLedSet(StatusColor::Green);
+    }
+    return true;
+  }
+
+  statusLedSet(StatusColor::Red);
+  return false;
+}
+
+void pollWebSocketClient() {
+  if (ws_server.poll()) {
+    ws_client = ws_server.accept();
+    ws_client.onEvent([](WebsocketsEvent event, String) {
+      if (event == WebsocketsEvent::ConnectionClosed) {
+        ws_client_connected = false;
+        Serial.println("Display disconnected");
+      }
+    });
+    ws_client_connected = true;
+    Serial.println("Display connected via WebSocket");
+    if (cameraIsReady()) {
+      statusLedSet(StatusColor::Green);
+    }
+  }
+
+  if (!ws_client_connected) {
+    return;
+  }
+
+  ws_client.poll();
+}
+
+bool sendFrame(const uint8_t *jpeg, size_t jpeg_len) {
+  if (!ws_client_connected || !send_buffer) {
     return false;
   }
 
-  Serial.printf("AP ready: %s @ %s\n", VIDEO_WIFI_SSID, WiFi.softAPIP().toString().c_str());
+  const size_t packet_len = VIDEO_FRAME_HEADER_SIZE + jpeg_len;
+  if (packet_len > VIDEO_MAX_JPEG_SIZE + VIDEO_FRAME_HEADER_SIZE) {
+    return false;
+  }
+
+  frame_id++;
+  memcpy(send_buffer, &frame_id, VIDEO_FRAME_HEADER_SIZE);
+  memcpy(send_buffer + VIDEO_FRAME_HEADER_SIZE, jpeg, jpeg_len);
+
+  if (!ws_client.sendBinary(reinterpret_cast<const char *>(send_buffer), packet_len)) {
+    Serial.println("WebSocket send dropped");
+    return false;
+  }
+
+  statusLedPulseFrame();
   return true;
 }
 
-void sendFrame(const uint8_t *jpeg, size_t jpeg_len) {
-  const size_t max_chunk = VIDEO_UDP_PAYLOAD_MAX - sizeof(VideoPacketHeader);
-  const uint16_t chunk_count =
-      static_cast<uint16_t>((jpeg_len + max_chunk - 1) / max_chunk);
+void bootLedPulse() {
+  statusLedSet(StatusColor::Red);
+  delay(200);
+  statusLedSet(StatusColor::Off);
+  delay(200);
+}
 
-  uint8_t packet[VIDEO_UDP_PAYLOAD_MAX];
-  frame_id++;
-
-  for (uint16_t chunk = 0; chunk < chunk_count; chunk++) {
-    const size_t offset = static_cast<size_t>(chunk) * max_chunk;
-    const size_t remaining = jpeg_len - offset;
-    const uint16_t payload_size =
-        static_cast<uint16_t>(remaining > max_chunk ? max_chunk : remaining);
-
-    VideoPacketHeader *header = reinterpret_cast<VideoPacketHeader *>(packet);
-    header->magic = VIDEO_MAGIC;
-    header->frame_id = frame_id;
-    header->chunk_index = chunk;
-    header->chunk_count = chunk_count;
-    header->payload_size = payload_size;
-    memcpy(packet + sizeof(VideoPacketHeader), jpeg + offset, payload_size);
-
-    const size_t packet_len = sizeof(VideoPacketHeader) + payload_size;
-    udp.beginPacket(IPAddress(255, 255, 255, 255), VIDEO_UDP_PORT);
-    udp.write(packet, packet_len);
-    udp.endPacket();
+void updateStatusLed() {
+  if (cameraIsReady() && ws_client_connected) {
+    statusLedSet(StatusColor::Green);
+  } else if (cameraIsReady()) {
+    statusLedSet(StatusColor::Blue);
+  } else if (ap_ready) {
+    static uint32_t last_blink_ms = 0;
+    static bool blink_on = false;
+    const uint32_t now = millis();
+    if (now - last_blink_ms >= 500) {
+      last_blink_ms = now;
+      blink_on = !blink_on;
+      statusLedSet(blink_on ? StatusColor::Red : StatusColor::Off);
+    }
+  } else {
+    statusLedSet(StatusColor::Red);
   }
 }
 
 void setup() {
+  statusLedBegin();
+  bootLedPulse();
+  bootLedPulse();
+  bootLedPulse();
+
   Serial.begin(115200);
   delay(200);
 
-  if (!initCamera() || !initWifiAp()) {
+#if CAMERA_BOARD_XIAO_S3_SENSE
+  Serial.println("Board: Seeed XIAO ESP32-S3 Sense (OV2640)");
+#else
+  Serial.println("Board: Freenove ESP32-S3 WROOM CAM");
+#endif
+  Serial.printf("Boot: chip %s, PSRAM %u bytes, reset %d\n", ESP.getChipModel(),
+                ESP.getFreePsram(), static_cast<int>(esp_reset_reason()));
+
+  send_buffer = static_cast<uint8_t *>(ps_malloc(VIDEO_MAX_JPEG_SIZE + VIDEO_FRAME_HEADER_SIZE));
+  if (!send_buffer) {
+    Serial.println("Send buffer alloc failed");
     while (true) {
-      delay(1000);
+      bootLedPulse();
     }
   }
 
-  udp.begin(VIDEO_UDP_PORT);
-  Serial.println("Streaming JPEG frames over UDP");
+  ap_ready = initWifiAp();
+  if (!ap_ready) {
+    Serial.println("WiFi AP failed");
+    while (true) {
+      bootLedPulse();
+    }
+  }
+
+  listenStreamServer();
+  Serial.printf("WebSocket server listening on port %u\n", VIDEO_WS_PORT);
+  Serial.println("AP up; starting camera in background");
 }
 
 void loop() {
-  const uint32_t frame_interval_ms = 1000 / STREAM_TARGET_FPS;
-  const uint32_t started = millis();
+  pollWebSocketClient();
+  updateStatusLed();
+
+  if (!cameraIsReady()) {
+    static uint32_t last_camera_retry_ms = 0;
+    static uint8_t failed_retries = 0;
+    const uint32_t now = millis();
+    const uint32_t retry_interval_ms = failed_retries > 10 ? 30000 : 5000;
+    if (now - last_camera_retry_ms >= retry_interval_ms) {
+      last_camera_retry_ms = now;
+      if (!ensureCamera()) {
+        failed_retries++;
+      } else {
+        failed_retries = 0;
+        Serial.println("Camera ready");
+      }
+    }
+    delay(10);
+    return;
+  }
+
+  if (!ap_ready || WiFi.softAPIP() == IPAddress(0, 0, 0, 0)) {
+    Serial.println("AP lost, restarting radio");
+    ap_ready = initWifiAp();
+    ws_client_connected = false;
+    listenStreamServer();
+    delay(500);
+    return;
+  }
+
+  if (!ws_client_connected) {
+    delay(10);
+    return;
+  }
 
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb || fb->format != PIXFORMAT_JPEG) {
     if (fb) {
       esp_camera_fb_return(fb);
     }
-    delay(5);
     return;
   }
 
@@ -127,9 +242,4 @@ void loop() {
   }
 
   esp_camera_fb_return(fb);
-
-  const uint32_t elapsed = millis() - started;
-  if (elapsed < frame_interval_ms) {
-    delay(frame_interval_ms - elapsed);
-  }
 }

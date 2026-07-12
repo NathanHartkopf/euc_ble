@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <JPEGDEC.h>
+
 #include <WiFi.h>
+#include <cstring>
 
 #include "config.h"
 #include "display_setup.h"
@@ -50,11 +52,38 @@ bool connectWifi() {
   return true;
 }
 
+void showSplash(const char *status) {
+  gfx->fillScreen(gfx->color565(8, 18, 52));
+  gfx->fillRect(0, 0, VIDEO_FRAME_WIDTH, 6, gfx->color565(0, 180, 220));
+  gfx->fillRect(0, VIDEO_FRAME_HEIGHT - 6, VIDEO_FRAME_WIDTH, 6, gfx->color565(0, 180, 220));
+
+  gfx->setTextColor(gfx->color565(255, 255, 255));
+  gfx->setTextSize(2);
+  gfx->setCursor((VIDEO_FRAME_WIDTH - 9 * 12) / 2, 42);
+  gfx->println("EUC VIDEO");
+
+  gfx->setTextSize(1);
+  gfx->setTextColor(gfx->color565(140, 170, 210));
+  gfx->setCursor((VIDEO_FRAME_WIDTH - 8 * 6) / 2, 72);
+  gfx->println("Receiver");
+
+  gfx->fillRect(40, 112, VIDEO_FRAME_WIDTH - 80, 14, gfx->color565(20, 36, 72));
+  gfx->fillRect(40, 112, (VIDEO_FRAME_WIDTH - 80) / 3, 14, gfx->color565(0, 180, 220));
+
+  if (status && status[0] != '\0') {
+    const int16_t text_width = static_cast<int16_t>(strlen(status)) * 6;
+    gfx->setTextColor(gfx->color565(255, 255, 255));
+    gfx->setCursor((VIDEO_FRAME_WIDTH - text_width) / 2, 138);
+    gfx->println(status);
+  }
+}
+
 void showStatus(const char *message, uint16_t color) {
+  Serial.printf("Status: %s\n", message);
   gfx->fillScreen(RGB565_BLACK);
-  gfx->setCursor(8, 8);
   gfx->setTextColor(color, RGB565_BLACK);
   gfx->setTextSize(2);
+  gfx->setCursor(8, (VIDEO_FRAME_HEIGHT - 16) / 2);
   gfx->println(message);
 }
 
@@ -65,7 +94,6 @@ void drawFrame(const uint8_t *data, size_t size) {
 
   crop_top = (jpeg.getHeight() > VIDEO_FRAME_HEIGHT) ? (jpeg.getHeight() - VIDEO_FRAME_HEIGHT) / 2 : 0;
 
-  gfx->fillScreen(RGB565_BLACK);
   jpeg.setPixelType(RGB565_BIG_ENDIAN);
   jpeg.decode(0, 0, 0);
   jpeg.close();
@@ -83,9 +111,8 @@ void logPlatformInfo() {
 void networkTask(void *param) {
   (void)param;
   for (;;) {
-    while (receiver.poll()) {
+    if (receiver.poll()) {
       xSemaphoreGive(frame_ready_sem);
-      ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     }
     vTaskDelay(1);
   }
@@ -98,14 +125,21 @@ void displayTask(void *param) {
       continue;
     }
 
-    const uint8_t *data = nullptr;
-    size_t size = 0;
-    if (receiver.acquireDisplayFrame(&data, &size)) {
-      drawFrame(data, size);
-      receiver.releaseDisplayFrame();
-    }
+    for (;;) {
+      const uint8_t *data = nullptr;
+      size_t size = 0;
+      uint32_t frame_id = 0;
+      if (!receiver.acquireDisplayFrame(&data, &size, &frame_id)) {
+        break;
+      }
 
-    xTaskNotifyGive(network_task_handle);
+      drawFrame(data, size);
+      receiver.releaseDisplayFrame(frame_id);
+
+      if (!receiver.poll()) {
+        break;
+      }
+    }
   }
 }
 #endif
@@ -115,14 +149,14 @@ void displayTask(void *param) {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  logPlatformInfo();
 
-  initIoExpanderBacklight();
+  initBacklight();
+  setBacklight(90);
 
   bus = createDisplayBus();
   gfx = createDisplay(bus);
 
-  if (!gfx->begin()) {
+  if (!beginDisplay(bus, gfx)) {
     Serial.println("Display init failed");
     while (true) {
       delay(1000);
@@ -130,8 +164,11 @@ void setup() {
   }
 
   configureDisplayBus(bus);
-  gfx->fillScreen(RGB565_BLACK);
-  showStatus("WiFi...", RGB565_YELLOW);
+  showSplash("Starting...");
+  Serial.println("Display init ok");
+
+  logPlatformInfo();
+  showSplash("WiFi...");
 
   if (!connectWifi()) {
     showStatus("WiFi failed", RGB565_RED);
@@ -140,18 +177,20 @@ void setup() {
     }
   }
 
-  if (!receiver.begin(VIDEO_UDP_PORT)) {
-    showStatus("UDP failed", RGB565_RED);
+  showSplash("WebSocket...");
+
+  if (!receiver.begin()) {
+    showStatus("Receiver failed", RGB565_RED);
     while (true) {
       delay(1000);
     }
   }
 
-  showStatus("Waiting video", RGB565_GREEN);
+  showSplash("Waiting video");
 
 #if USE_DUAL_CORE_PIPELINE
   frame_ready_sem = xSemaphoreCreateBinary();
-  xTaskCreatePinnedToCore(networkTask, "video_net", 6144, nullptr, 2, &network_task_handle,
+  xTaskCreatePinnedToCore(networkTask, "video_net", 8192, nullptr, 2, &network_task_handle,
                           NETWORK_TASK_CORE);
   xTaskCreatePinnedToCore(displayTask, "video_lcd", 8192, nullptr, 1, nullptr, DISPLAY_TASK_CORE);
   Serial.println("Dual-core video pipeline active");
@@ -162,14 +201,14 @@ void loop() {
 #if USE_DUAL_CORE_PIPELINE
   vTaskDelay(portMAX_DELAY);
 #else
-  while (receiver.poll()) {
-  }
-
-  const uint8_t *data = nullptr;
-  size_t size = 0;
-  if (receiver.acquireDisplayFrame(&data, &size)) {
-    drawFrame(data, size);
-    receiver.releaseDisplayFrame();
+  if (receiver.poll()) {
+    const uint8_t *data = nullptr;
+    size_t size = 0;
+    uint32_t frame_id = 0;
+    if (receiver.acquireDisplayFrame(&data, &size, &frame_id)) {
+      drawFrame(data, size);
+      receiver.releaseDisplayFrame(frame_id);
+    }
   }
 #endif
 }

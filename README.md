@@ -3,8 +3,8 @@
 Four PlatformIO projects for electric-unicycle (EUC) telemetry and low-latency WiFi video:
 
 - **Arduino Nano 33 IoT** — BLE telemetry collector + web UI (reference implementation)
-- **ESP32-S3 CAM** — WiFi UDP video sender
-- **ESP32-S3 LCD** — WiFi UDP video receiver
+- **ESP32-S3 CAM** — WiFi WebSocket video sender
+- **ESP32-S3 LCD** — WiFi WebSocket video receiver
 - **ESP32-C6 LCD** — LVGL telemetry HUD (BLE to Nosfet Apex)
 
 ---
@@ -54,12 +54,12 @@ euc_ble/
 │   └── src/
 │       └── main.cpp                   Production firmware (BLE + hotspot + web UI)
 │
-├── esp32-cam-s3-streamer/             ← Camera → UDP JPEG sender
-│   ├── platformio.ini
-│   ├── include/config.h, camera_pins.h, video_protocol.h
-│   └── src/main.cpp
+├── esp32-cam-s3-streamer/             ← Camera → WebSocket JPEG sender
+│   ├── platformio.ini                 esp32cam-xiao-s3 (default), esp32cam-freenove
+│   ├── include/board_config.h, camera_pins.h, camera_setup.h, config.h, status_led.h, video_protocol.h
+│   └── src/main.cpp, camera_setup.cpp
 │
-├── esp32-s3-lcd-display/              ← UDP JPEG receiver → ST7789 LCD (S3 + PSRAM)
+├── esp32-s3-lcd-display/              ← WebSocket JPEG receiver → 1.47" LCD (S3 + PSRAM)
 │   ├── platformio.ini
 │   ├── include/config.h, display_setup.h, frame_receiver.h, video_protocol.h
 │   └── src/main.cpp, frame_receiver.cpp
@@ -193,20 +193,27 @@ spd=0.0 km/h  amp=0.0 A  volt=151.2 V  batt=85%  ...
 ### What it does
 
 - Boots as WiFi **access point**: SSID `EUC-VIDEO`, password `eucvideo1`.
-- Captures **QVGA (320×240) JPEG** from the onboard camera (~15 FPS target).
-- Fragments each JPEG and **UDP-broadcasts** on port **5555** using the shared `video_protocol.h` format.
+- Captures **QVGA (320×240) JPEG** from the onboard camera (`CAMERA_GRAB_LATEST`, no artificial FPS cap).
+- Runs a **WebSocket server** on port **80**; each binary message is one atomic JPEG: `[4-byte frame_id][jpeg bytes]`.
+- Brings WiFi AP up first, then initializes the camera in the background so the link stays usable even if the sensor is slow to probe.
 
-### PlatformIO
+### PlatformIO environments
+
+| Environment | Board | Notes |
+|-------------|-------|-------|
+| `esp32cam-xiao-s3` (**default**) | Seeed XIAO ESP32-S3 Sense | OV2640, native USB CDC, GPIO 21 status LED |
+| `esp32cam-freenove` | Freenove ESP32-S3 WROOM CAM | 16 MB flash, WS2812 on GPIO 48 |
 
 ```ini
-[env:esp32cam-s3]
-platform = espressif32
-board = esp32-s3-devkitc-1
+[env:esp32cam-xiao-s3]
+platform = espressif32@6.9.0
+board = seeed_xiao_esp32s3
+build_flags = -DBOARD_SEED_XIAO_ESP32S3_SENSE
 ```
 
-Pins: Freenove ESP32-S3 WROOM camera profile in `include/camera_pins.h`.
+Camera pins and sensor tuning live in `include/camera_pins.h`, `include/camera_setup.cpp`, and `include/config.h` (selected by `include/board_config.h`).
 
-**Status:** Created and builds; not yet field-tested in this session.
+**Status:** Field-tested on Waveshare Touch-LCD receiver over WebSocket; Seeed XIAO profile builds and is ready to flash.
 
 ---
 
@@ -214,21 +221,24 @@ Pins: Freenove ESP32-S3 WROOM camera profile in `include/camera_pins.h`.
 
 ### What it does
 
-- Runs on **Waveshare ESP32-S3-LCD-1.47** (16 MB flash, 8 MB OPI PSRAM, dual-core @ 240 MHz).
+- Runs on **Waveshare ESP32-S3-Touch-LCD-1.47** (JD9853 panel, 8 MB OPI PSRAM, dual-core @ 240 MHz).
 - Connects as WiFi **station** to the camera AP (`EUC-VIDEO`).
-- Listens for UDP port **5555**, reassembles JPEG fragments into **PSRAM frame buffers**.
-- Decodes and displays on the onboard **1.47" ST7789** panel in landscape (**320×172** visible area).
-- Uses a **dual-core pipeline**: core 0 receives UDP, core 1 decodes and draws — leaves headroom for future LVGL overlays.
+- Opens a **WebSocket client** to `ws://192.168.4.1:80`, receives full JPEG frames (no UDP reassembly).
+- Decodes with **JPEGDEC** and draws tile-by-tile via **Arduino_GFX** in landscape (**320×172** visible area).
+- Uses a **dual-core pipeline**: core 0 polls WebSocket, core 1 decodes and draws; skips stale frames by `frame_id`.
+- Also supports legacy **Waveshare ESP32-S3-LCD-1.47** (ST7789) via `BOARD_WAVESHARE_ESP32_S3_LCD_147` in `platformio.ini`.
 
 ### PlatformIO environments
 
 | Environment | Board |
 |-------------|-------|
-| `esp32-s3-lcd` | Waveshare ESP32-S3-LCD-1.47 (**default / supported**) |
+| `esp32-s3-lcd` | Waveshare ESP32-S3-Touch-LCD-1.47 (**default / supported**) |
+| `esp32-c3-lcd` | Waveshare ESP32-C3-LCD-1.47 (reference, no PSRAM pipeline) |
+| `esp32-c6-lcd` | Waveshare ESP32-C6-LCD-1.47 (reference) |
 
-Uses GFX Library + JPEGDEC. PSRAM buffers and dual-core tasks are enabled on the S3 target.
+Uses GFX Library + JPEGDEC + ArduinoWebsockets. PSRAM buffers and dual-core tasks are enabled on the S3 target.
 
-**Status:** Built for S3; not yet field-tested.
+**Status:** Working on Touch-LCD-1.47 with live camera feed over WebSocket.
 
 ---
 
@@ -270,7 +280,7 @@ Requires **SDL2** (`brew install sdl2`). Live mode reads `HUD,...` CSV lines fro
 ### Architecture (split roles)
 
 ```
-ESP32-S3 CAM  ──WiFi UDP video──▶  ESP32-S3 LCD  (live camera feed)
+ESP32-S3 CAM  ──WiFi WebSocket──▶  ESP32-S3 LCD  (live camera feed)
 
 Nosfet Apex  ◀──BLE central────  ESP32-C6 HUD  ──BLE peripheral──▶  DarknessBot / phone
                  (FFE1 notify)                      (FFE0/FFE1 proxy)
@@ -305,10 +315,12 @@ Defined in `video_protocol.h` (identical in both ESP32 projects):
 
 | Field | Value |
 |-------|-------|
-| Magic | `EVCV` (4 bytes) |
-| UDP port | 5555 |
+| WiFi SSID | `EUC-VIDEO` |
+| WiFi password | `eucvideo1` |
+| Cam AP IP | `192.168.4.1` |
+| WebSocket URL | `ws://192.168.4.1:80/` |
 | Max JPEG size | 32 KB |
-| Packet layout | Header + chunked payload with sequence/frame IDs |
+| Frame payload | `[frame_id: uint32][jpeg bytes…]` |
 
 The receiver crops QVGA 320×240 → 320×172 to match the physical panel.
 
@@ -320,8 +332,8 @@ The receiver crops QVGA 320×240 → 320×172 to match the physical panel.
 |--------|------|
 | **Arduino Nano 33 IoT** | BLE telemetry collector |
 | **Nosfet Apex** | Target EUC (151.2 V, Veteran protocol) |
-| **ESP32-S3 CAM** (Freenove) | Planned video sender |
-| **ESP32-S3-LCD-1.47** (Waveshare) | Video receiver (8 MB PSRAM) |
+| **ESP32-S3 CAM** (Seeed XIAO Sense or Freenove) | Video sender (WebSocket AP) |
+| **ESP32-S3-Touch-LCD-1.47** (Waveshare) | Video receiver (JD9853, 8 MB PSRAM) |
 | **ESP32-C6-LCD-1.47** (Waveshare) | BLE telemetry HUD (LVGL) |
 
 ---
@@ -477,14 +489,19 @@ while True:
 ### ESP32 video projects
 
 ```bash
-# Camera sender
+# Camera sender (Seeed XIAO ESP32-S3 Sense — default)
 cd esp32-cam-s3-streamer
-pio run -e esp32cam-s3 -t upload
+pio run -e esp32cam-xiao-s3 -t upload --upload-port /dev/cu.usbmodem*
 
-# LCD video receiver (S3)
+# Camera sender (Freenove ESP32-S3 WROOM CAM — legacy)
+pio run -e esp32cam-freenove -t upload --upload-port /dev/cu.usbserial-*
+
+# LCD video receiver (Waveshare Touch-LCD-1.47)
 cd esp32-s3-lcd-display
-pio run -e esp32-s3-lcd -t upload
+pio run -e esp32-s3-lcd -t upload --upload-port /dev/cu.usbmodem*
 ```
+
+Power the **camera first** (creates `EUC-VIDEO` AP), then the display. The display reconnects WebSocket automatically if the cam boots later.
 
 ---
 
@@ -525,6 +542,22 @@ Use pyserial directly with `dtr=True` (see Serial monitor above).
 
 Update NINA to 3.0.1 (see above). On old firmware the sketch falls back to a 12 s boot OTA window then BLE-only.
 
+### Video: display shows "Waiting video"
+
+- Confirm the cam AP `EUC-VIDEO` is visible and serial shows `WebSocket server listening`.
+- Cam must initialize the sensor (`Camera init ok` in serial) before frames flow.
+- Display connects to `ws://192.168.4.1:80` after joining the AP.
+
+### Video: feed flashes or drops after ~1 s
+
+- Fixed in current firmware: do not treat `ws_client.available() == false` as disconnect on the cam (display is receive-only).
+- Reflash both cam and display if you see repeated "Cam connected" splash over video.
+
+### Freenove cam: no serial / won't flash
+
+- Use BOOT + RESET to enter download mode; CH340 port is `/dev/cu.usbserial-*`.
+- Seeed XIAO Sense uses native USB (`/dev/cu.usbmodem*`) and does not need CH340.
+
 ---
 
 ## Current status and next steps
@@ -538,13 +571,13 @@ Update NINA to 3.0.1 (see above). On old firmware the sketch falls back to a 12 
 | NINA firmware 3.0.1 | **Done** |
 | ESP32-C6 HUD simulator | **Working** — mock + live Nano serial |
 | ESP32-C6 HUD firmware | Built, not field-tested on hardware |
-| ESP32-CAM streamer | Built, not field-tested |
-| ESP32-S3 LCD receiver | Built for S3 + PSRAM, not field-tested |
+| ESP32-CAM streamer | **Working** — WebSocket; XIAO + Freenove profiles |
+| ESP32-S3 LCD receiver | **Working** — Touch-LCD-1.47, live WebSocket video |
 
 ### Recommended next steps
 
 1. Flash and bench-test the ESP32-C6 HUD on hardware.
-2. Flash and bench-test the ESP32 video pair.
+2. Flash Seeed XIAO ESP32-S3 Sense cam profile and validate range/antenna.
 3. Re-add OTA upload for the Nano if desired (currently USB-only).
 
 ---
